@@ -4,7 +4,7 @@ void forwardKinematics(){
 
 }
 
-void backwardKinematics(){
+void inverseKinematics(){
 
 }
 
