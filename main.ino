@@ -12,12 +12,24 @@ void inverseKinematics(){
 
 }
 
+void nolkanPosisi(){
+
+}
+
+void sudutKeServo(){
+
+}
+
 void readInput(){
 
 }
 
 bool cekBatas(){
   // Mengecek apakah posisi yang diharapkan itu bisa dicapai
+}
+
+void gerakServo(){
+
 }
 
 void setup(){
