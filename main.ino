@@ -15,8 +15,8 @@ void forwardKinematics(){
   float a2 = t1 + t2;
   float a3 = t1 + t2 + t3;
 
-  float r = (L1 * cos(a1)) + (L2 * cos(a2)) + (L3 * cos(a3));
-  z = L0 + (L1 * sin(a1)) + (L2 * sin(a2)) + (L3 * sin(a3));
+  float r = (L1 * sin(a1)) + (L2 * sin(a2)) + (L3 * sin(a3));
+  z = L0 + (L1 * cos(a1)) + (L2 * cos(a2)) + (L3 * cos(a3));
   x = r * cos(t0);
   y = r * sin(t0);
 }
