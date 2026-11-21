@@ -26,7 +26,12 @@ void inverseKinematics(){
 }
 
 void nolkanPosisi(){
+for (int i = 0; i < 5; i++){
+    sudut[i] = 0;
+  }
 
+  sudutkeServo();
+  forwardKinematics();
 }
 
 void sudutKeServo(){
