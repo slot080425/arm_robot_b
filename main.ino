@@ -1,29 +1,43 @@
+#include <Arduino.h>
 #include <ESP32Servo.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+const char* WIFI_SSID = "m1su";
+const char* WIFI_PASS = "250408zz";
 
 Servo servo[5];
+WebServer server(80);
 
-// L0 = dasar-bahu, L1 = bahu-siku, L2 = siku-pergelangan, L3 = pergelangan-gripper (cm)
+// Panjang antar poros (cm): L0 = tinggi bahu dari dasar, L1 = bahu-siku,
+// L2 = siku-pergelangan, L3 = pergelangan-ujung gripper
 const float L0 = 11.0, L1 = 12.0, L2 = 13.0, L3 = 9.0;
 
+// Urutan: 0 = basis, 1 = bahu, 2 = siku, 3 = pergelangan, 4 = gripper
 const int pinServo[5] = {13, 14, 27, 26, 25};
 
-// servoDeg = arah * offset + sudut
+// Kalibrasi: servoDeg = arah * sudut + offset
+// offset = sudut servo saat link mendatar, arah = +1 / -1 jika terbalik
 float arah[4]   = {1, 1, 1, 1};
 float offset[4] = {90, 90, 90, 90};
 
 const float GRIPPER_BUKA  = 60.0;
 const float GRIPPER_TUTUP = 120.0;
 
-float sudut[5]; // sudut fk                          
-float servoDeg[5];                           
-float servoNow[5] = {90, 90, 90, 90, 90};   
+const unsigned long LANGKAH_MS = 15;        // jeda tiap langkah 1 derajat (makin besar makin lambat)
 
-float x, y, z; // output fk                              
-float tx, ty, tz; // input ik                           
-bool  bisa = false; // ik ketemu solusi = true                  
-int   mode = -1; // 0 = input, 1 = sudut fk, 2 = sudut servo                             
+float sudut[5];                             // sudut kinematika (derajat); hasil hitung sementara
+float servoCalon[5];                        // hasil hitung yang belum tentu aman
+float servoDeg[5];                          // tujuan aktif yang dikejar servo (sudah lolos cek)
+float servoNow[5] = {90, 90, 90, 90, 90};   // posisi servo saat ini
+
+float x, y, z;                              // hasil FK
+float tx, ty, tz;                           // target IK
+bool  bisa = false;                         // true jika IK menemukan solusi
 String laporan;
 
+
+// FK: posisi ujung dari sudut sendi q (radian), konvensi horizontal
 void fkPos(const float q[4], float p[3]){
   float a1 = q[1];
   float a2 = q[1] + q[2];
@@ -45,6 +59,7 @@ void forwardKinematics(){
   x = p[0]; y = p[1]; z = p[2];
 }
 
+// Jacobian 3x4: kolom j = gerak ujung per radian sendi j
 void jacobian(const float q[4], float J[3][4]){
   float a[4]  = {0, q[1], q[1] + q[2], q[1] + q[2] + q[3]};
   float Ls[4] = {0, L1, L2, L3};
@@ -53,8 +68,10 @@ void jacobian(const float q[4], float J[3][4]){
   float r = 0;
   for (int i = 1; i <= 3; i++) r += Ls[i] * cos(a[i]);
 
+  // basis: memutar ujung tegak lurus jari-jari, tinggi tidak berubah
   J[0][0] = -r * s0;  J[1][0] = r * c0;  J[2][0] = 0;
 
+  // bahu, siku, pergelangan: tiap sendi menggerakkan link ke-j sampai ujung
   for (int j = 1; j <= 3; j++) {
     float rj = 0, zj = 0;
     for (int i = j; i <= 3; i++) {
@@ -67,6 +84,7 @@ void jacobian(const float q[4], float J[3][4]){
   }
 }
 
+// determinan dan penyelesaian sistem 3x3 (aturan Cramer)
 float det3(float A[3][3]){
   return A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1])
        - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0])
@@ -85,8 +103,10 @@ bool solve3(float A[3][3], const float b[3], float s[3]){
   return true;
 }
 
+// Satu percobaan IK dari tebakan awal q. true jika galat < toleransi.
 bool iterasi(float q[4], const float target[3], const float lo[4], const float hi[4]){
-  const float lambda = 0.5, tol = 0.1, langkahMax = 0.3;
+  const float lambda = 0.5, tol = 0.1, langkahMax = 0.3;   // tol dalam cm, langkah dalam radian
+
   for (int it = 0; it < 300; it++) {
     float p[3];
     fkPos(q, p);
@@ -112,17 +132,25 @@ bool iterasi(float q[4], const float target[3], const float lo[4], const float h
       norma += dq[j] * dq[j];
     }
     norma = sqrt(norma);
-    float skala = (norma > langkahMax) ? langkahMax / norma : 1.0;   
+    float skala = (norma > langkahMax) ? langkahMax / norma : 1.0;   // batasi besar langkah
 
     for (int j = 0; j < 4; j++) q[j] = constrain(q[j] + dq[j] * skala, lo[j], hi[j]);
   }
   return false;
 }
 
+
+// IK
 void inverseKinematics(){
   bisa = false;
   float target[3] = {tx, ty, tz};
 
+  // tolak bila target lebih jauh dari panjang lengan (dari poros bahu)
+  float r = sqrt(tx * tx + ty * ty);
+  float jarak = sqrt(r * r + (tz - L0) * (tz - L0));
+  if (jarak > L1 + L2 + L3) return;
+
+  // batas sendi dalam sudut kinematika (radian), dari batas servo 0-180
   float lo[4], hi[4];
   for (int i = 0; i < 4; i++) {
     float a = (0   - offset[i]) / arah[i] * DEG_TO_RAD;
@@ -131,6 +159,7 @@ void inverseKinematics(){
     hi[i] = max(a, b);
   }
 
+  // tebakan awal bahu, siku, pergelangan (radian); baris pertama tidak dipakai
   const float awal[6][3] = {
     {0, 0, 0},
     {0.5, -1.0, 0.5}, {1.0, -1.0, -0.3}, {0.3, 1.0, -1.0},
@@ -140,7 +169,8 @@ void inverseKinematics(){
   for (int n = 0; n < 6; n++) {
     float q[4];
     if (n == 0) {
-      for (int i = 0; i < 4; i++) q[i] = (servoNow[i] - offset[i]) / arah[i] * DEG_TO_RAD;
+      for (int i = 0; i < 4; i++) q[i] = (servoDeg[i] - offset[i]) / arah[i] * DEG_TO_RAD;
+      // lengan lurus = singular (Jacobian kehilangan arah), beri tekukan awal
       if (fabs(q[2]) < 0.1) { q[1] = 0.5; q[2] = -1.0; q[3] = 0.5; }
     } else {
       for (int j = 1; j <= 3; j++) q[j] = awal[n][j - 1];
@@ -156,44 +186,53 @@ void inverseKinematics(){
   }
 }
 
+
 void sudutKeServo(){
-  for (int i = 0; i < 4; i++) servoDeg[i] = arah[i] * sudut[i] + offset[i];
+  for (int i = 0; i < 4; i++) servoCalon[i] = arah[i] * sudut[i] + offset[i];
 }
 
 void servoKeSudut(){
-  for (int i = 0; i < 4; i++) sudut[i] = (servoDeg[i] - offset[i]) / arah[i];
+  for (int i = 0; i < 4; i++) sudut[i] = (servoCalon[i] - offset[i]) / arah[i];
 }
 
+// Servo hanya menerima 0-180; calon di luar itu ditolak, tujuan aktif tidak berubah
 bool cekBatas(){
   if (!bisa) return false;
   for (int i = 0; i < 4; i++) {
-    if (servoDeg[i] < -0.01 || servoDeg[i] > 180.01) return false;   
+    if (servoCalon[i] < -0.01 || servoCalon[i] > 180.01) return false;   // toleransi pembulatan
   }
   return true;
 }
 
-void gerakServo(){
-  bool masihGerak = true;
-  while (masihGerak) {
-    masihGerak = false;
-    for (int i = 0; i < 4; i++) {
-      if (servoNow[i] < servoDeg[i]) {
-        servoNow[i] = min(servoNow[i] + 1, servoDeg[i]);
-        masihGerak = true;
-      } else if (servoNow[i] > servoDeg[i]) {
-        servoNow[i] = max(servoNow[i] - 1, servoDeg[i]);
-        masihGerak = true;
-      }
+// Dipanggil terus-menerus dari loop(): maju 1 derajat tiap LANGKAH_MS menuju servoDeg.
+// Tidak memblokir, sehingga web tetap dilayani dan tombol Stop bisa bekerja.
+void langkahServo(){
+  static unsigned long terakhir = 0;
+  if (millis() - terakhir < LANGKAH_MS) return;
+  terakhir = millis();
+
+  for (int i = 0; i < 4; i++) {
+    if (servoNow[i] < servoDeg[i]) {
+      servoNow[i] = min(servoNow[i] + 1, servoDeg[i]);
+      servo[i].write((int)servoNow[i]);
+    } else if (servoNow[i] > servoDeg[i]) {
+      servoNow[i] = max(servoNow[i] - 1, servoDeg[i]);
       servo[i].write((int)servoNow[i]);
     }
-    delay(15);
   }
 }
 
+// Berhenti di posisi sekarang. Servo tetap menahan posisi (torsi aktif).
+void berhenti(){
+  for (int i = 0; i < 4; i++) servoDeg[i] = servoNow[i];
+}
+
+// Semua sudut kinematika 0 = lengan lurus mendatar (servo langsung melompat)
 void nolkanPosisi(){
   for (int i = 0; i < 5; i++) sudut[i] = 0;
   sudutKeServo();
   for (int i = 0; i < 4; i++) {
+    servoDeg[i] = servoCalon[i];
     servoNow[i] = servoDeg[i];
     servo[i].write((int)servoNow[i]);
   }
@@ -207,80 +246,191 @@ void setGripper(float g){
   servo[4].write((int)g);
 }
 
+// Alur satu perintah: hitung calon -> cek batas -> jadikan tujuan aktif -> laporan
+// m = 0: target (tx ty tz), m = 2: sudut servo langsung (servoCalon sudah diisi)
 bool proses(int m){
-  if (m == 0)      { inverseKinematics(); sudutKeServo(); }
-  else if (m == 1) { bisa = true; sudutKeServo(); }
-  else             { bisa = true; servoKeSudut(); }
+  if (m == 0) { inverseKinematics(); if (bisa) sudutKeServo(); }
+  else        { bisa = true; servoKeSudut(); }
 
   if (!cekBatas()) {
-    laporan = "Target tidak bisa dicapai (di luar jangkauan atau melebihi batas servo)";
+    laporan = "Tidak terjangkau (di luar jangkauan atau melebihi batas servo)";
     return false;
   }
 
+  for (int i = 0; i < 4; i++) servoDeg[i] = servoCalon[i];   
+
   forwardKinematics();                      
-  laporan = "Sudut kinematika: ";
-  for (int i = 0; i < 4; i++) laporan += String(sudut[i], 1) + " ";
-  laporan += "\nSudut servo     : ";
-  for (int i = 0; i < 4; i++) laporan += String(servoDeg[i], 1) + " ";
-  laporan += "\nFK              : " + String(x, 1) + ", " + String(y, 1) + ", " + String(z, 1);
-  laporan += "\nArah gripper    : " + String(sudut[1] + sudut[2] + sudut[3], 1) + " deg dari horizontal";
+  laporan = "Servo: ";
+  for (int i = 0; i < 4; i++) laporan += String(servoCalon[i], 0) + " ";
+  laporan += "\nFK   : " + String(x, 1) + ", " + String(y, 1) + ", " + String(z, 1);
+  laporan += "\nGripper: " + String(sudut[1] + sudut[2] + sudut[3], 0) + " deg dari horizontal";
   return true;
 }
 
-void readInput(){
-  mode = -1;
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) return;
 
-  char c = line.charAt(0);
+const char HALAMAN[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lengan Robot</title>
+<style>
+  body { font-family: sans-serif; max-width: 420px; margin: 20px auto; padding: 0 12px; }
+  input[type=range] { width: 100%; }
+  input[type=number] { width: 60px; padding: 6px; margin: 2px; }
+  button { padding: 10px 14px; margin: 4px 2px; }
+  .stop { background: #c62828; color: white; font-weight: bold; font-size: 18px; width: 100%; padding: 14px; border: 0; border-radius: 6px; }
+  pre { background: #eee; padding: 10px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<button class="stop" onclick="berhenti()">STOP</button>
 
-  if (c == 'g') {
-    setGripper(line.substring(1).toFloat());
-    Serial.println("Gripper: " + String(servoNow[4], 0));
+<h3>Posisi ujung (cm)</h3>
+x: <b id="vx">-</b><br>
+<input type="range" id="x" min="0" max="35" step="0.5" value="30" oninput="geser()">
+y: <b id="vy">-</b><br>
+<input type="range" id="y" min="-35" max="35" step="0.5" value="0" oninput="geser()">
+z: <b id="vz">-</b><br>
+<input type="range" id="z" min="0" max="45" step="0.5" value="11" oninput="geser()">
+
+<h3>Gripper</h3>
+<button onclick="kirim('/g?val=60')">Buka</button>
+<button onclick="kirim('/g?val=120')">Tutup</button>
+
+<details>
+<summary>Kalibrasi: sudut servo langsung</summary>
+<input type="number" id="a" value="90"><input type="number" id="b" value="90"><input type="number" id="c" value="90"><input type="number" id="d" value="90"><br>
+<button onclick="kirimServo()">Kirim</button>
+</details>
+
+<pre id="out">Siap.</pre>
+
+<script>
+function v(id){ return document.getElementById(id).value; }
+function tampil(t){ document.getElementById('out').textContent = t; }
+
+var sibuk = false, tertunda = false;
+
+function geser(){
+  document.getElementById('vx').textContent = v('x');
+  document.getElementById('vy').textContent = v('y');
+  document.getElementById('vz').textContent = v('z');
+  kirimIK();
+}
+
+// Hanya satu permintaan berjalan; nilai slider terbaru dikirim begitu yang lama selesai
+function kirimIK(){
+  if (sibuk) { tertunda = true; return; }
+  sibuk = true;
+  fetch('/ik?x=' + v('x') + '&y=' + v('y') + '&z=' + v('z'))
+    .then(function(r){ return r.text(); })
+    .then(tampil)
+    .catch(function(){ tampil('Gagal terhubung ke ESP32'); })
+    .finally(function(){
+      sibuk = false;
+      if (tertunda) { tertunda = false; kirimIK(); }
+    });
+}
+
+function kirim(url){
+  fetch(url).then(function(r){ return r.text(); }).then(tampil)
+    .catch(function(){ tampil('Gagal terhubung ke ESP32'); });
+}
+
+function berhenti(){ tertunda = false; kirim('/stop'); }
+function kirimServo(){ kirim('/v?a='+v('a')+'&b='+v('b')+'&c='+v('c')+'&d='+v('d')); }
+
+// Saat halaman dibuka, isi slider sesuai posisi tujuan lengan sekarang
+fetch('/pos').then(function(r){ return r.text(); }).then(function(t){
+  var p = t.split(',');
+  document.getElementById('x').value = p[0];
+  document.getElementById('y').value = p[1];
+  document.getElementById('z').value = p[2];
+  document.getElementById('vx').textContent = v('x');
+  document.getElementById('vy').textContent = v('y');
+  document.getElementById('vz').textContent = v('z');
+}).catch(function(){});
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleIK(){
+  if (!(server.hasArg("x") && server.hasArg("y") && server.hasArg("z"))) {
+    server.send(400, "text/plain", "Parameter kurang");
     return;
   }
+  tx = server.arg("x").toFloat();
+  ty = server.arg("y").toFloat();
+  tz = server.arg("z").toFloat();
 
-  if (c == 's' || c == 'v') {
-    float *d = (c == 's') ? sudut : servoDeg;
-    if (sscanf(line.c_str() + 1, "%f %f %f %f", &d[0], &d[1], &d[2], &d[3]) == 4) {
-      mode = (c == 's') ? 1 : 2;
-    } else {
-      Serial.println("Format salah. Contoh: s 0 30 45 -20");
-    }
+  proses(0);                               
+  server.send(200, "text/plain", laporan);
+}
+
+void handleServo(){
+  if (!(server.hasArg("a") && server.hasArg("b") && server.hasArg("c") && server.hasArg("d"))) {
+    server.send(400, "text/plain", "Parameter kurang");
     return;
   }
+  servoCalon[0] = server.arg("a").toFloat();
+  servoCalon[1] = server.arg("b").toFloat();
+  servoCalon[2] = server.arg("c").toFloat();
+  servoCalon[3] = server.arg("d").toFloat();
 
-  if (sscanf(line.c_str(), "%f %f %f", &tx, &ty, &tz) == 3) {
-    mode = 0;
-  } else {
-    Serial.println("Format salah. Contoh: 25 0 15");
-  }
+  proses(2);
+  server.send(200, "text/plain", laporan);
+}
+
+void handleGripper(){
+  setGripper(server.arg("val").toFloat());
+  server.send(200, "text/plain", "Gripper: " + String(servoNow[4], 0));
+}
+
+void handleStop(){
+  berhenti();
+  server.send(200, "text/plain", "BERHENTI di posisi sekarang");
+}
+
+// Posisi tujuan lengan saat ini (dari servoDeg), untuk mengisi slider saat halaman dibuka
+void handlePos(){
+  for (int i = 0; i < 4; i++) sudut[i] = (servoDeg[i] - offset[i]) / arah[i];
+  forwardKinematics();
+  server.send(200, "text/plain", String(x, 1) + "," + String(y, 1) + "," + String(z, 1));
 }
 
 void setup(){
   Serial.begin(115200);
-  Serial.setTimeout(50);
 
   for (int i = 0; i < 5; i++) servo[i].attach(pinServo[i]);
   nolkanPosisi();
 
-  Serial.println("Siap. Perintah:");
-  Serial.println("  tx ty tz       (target IK, contoh: 25 0 15)");
-  Serial.println("  s a b c d      (sudut fk)");
-  Serial.println("  v a b c d      (sudut servo)");
-  Serial.println("  g sudut        (gripper)");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Menyambung WiFi");
+  unsigned long mulai = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - mulai < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Buka di browser: http://");
+    Serial.println(WiFi.localIP());
+    server.on("/", []() { server.send_P(200, "text/html", HALAMAN); });
+    server.on("/ik", handleIK);
+    server.on("/v", handleServo);
+    server.on("/g", handleGripper);
+    server.on("/stop", handleStop);
+    server.on("/pos", handlePos);
+    server.begin();
+  } else {
+    Serial.println("WiFi gagal. Periksa SSID dan password, lalu reset.");
+  }
 }
 
 void loop(){
-  if (!Serial.available()) return;
-  readInput();
-  if (mode < 0) return;
-
-  if (proses(mode)) {
-    Serial.println(laporan);
-    gerakServo();
-  } else {
-    Serial.println(laporan);
-  }
+  server.handleClient();
+  langkahServo();
 }
